@@ -559,11 +559,18 @@ func (a *App) restoreOrBuildTabs() {
 			tab.model = entry.Model
 			tab.effort = cloneStringPtr(entry.Effort)
 			tab.tokenMode = boot.NormalizeTokenMode(entry.TokenMode)
-			tab.mode = persistedTabMode(entry.Mode)
+			tab.mode = normalizeTabMode(entry.Mode)
 			tab.goal = strings.TrimSpace(entry.Goal)
 			tab.toolApprovalMode = normalizeToolApprovalMode(entry.ToolApprovalMode)
 			if tab.toolApprovalMode == control.ToolApprovalAsk && tabModeHasAutoApproveTools(entry.Mode) {
 				tab.toolApprovalMode = control.ToolApprovalYolo
+			}
+			// Reverse reconciliation: ensure mode is "yolo" when toolApproval says "yolo".
+			// Without this, loading a tab with entry.Mode="" (old format) + toolApproval="yolo"
+			// would leave tab.mode="" while the controller gets correct state via
+			// applyTabToolApprovalModeToController. This check makes tab.mode consistent.
+			if tab.mode == "normal" && tab.toolApprovalMode == control.ToolApprovalYolo {
+				tab.mode = "yolo"
 			}
 			tab.SessionPath = strings.TrimSpace(entry.SessionPath)
 			tab.ReadOnly = entry.ReadOnly

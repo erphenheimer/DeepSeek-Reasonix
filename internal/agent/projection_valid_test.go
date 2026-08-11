@@ -322,3 +322,87 @@ func TestCompactInstallsCoveredPrefixHash(t *testing.T) {
 		t.Fatal("fresh projection should validate")
 	}
 }
+func TestLoadProjectionSidecarRebindsInheritedRecoveryFork(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+
+	// Parent session: compressed, valid projection sidecar on disk.
+	parent := NewSession("sys")
+	parent.Add(provider.Message{Role: provider.RoleUser, Content: "first"})
+	parent.Add(provider.Message{Role: provider.RoleAssistant, Content: "one"})
+	parent.Add(provider.Message{Role: provider.RoleUser, Content: "second"})
+	if err := parent.Save(path); err != nil {
+		t.Fatalf("Save parent: %v", err)
+	}
+	parentMsgs, parentVersion := parent.snapshotMessagesVersion()
+	parentKey := promptCacheKey("ws", BranchID(path), "this-model")
+	if err := SaveCompactionState(path, CompactionState{
+		SchemaVersion:     compactionStateSchemaCurrent,
+		TranscriptVersion: parentVersion,
+		PromptCacheKey:    parentKey,
+		Projection: ContextProjection{
+			ProjectionVersion: 1,
+			CoveredCount:      2,
+			CoveredPrefixHash: coveredPrefixHash(parentMsgs, 2),
+			Messages: []provider.Message{
+				{Role: provider.RoleUser, Content: "summary"},
+				{Role: provider.RoleAssistant, Content: "one"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("SaveCompactionState: %v", err)
+	}
+
+	// Diverged in-memory session forks a recovery branch that inherits the
+	// parent's projection sidecar (saveRecoveryBranch.inheritParentProjection).
+	stale := NewSession("sys")
+	stale.Add(provider.Message{Role: provider.RoleUser, Content: "first"})
+	stale.Add(provider.Message{Role: provider.RoleAssistant, Content: "one"})
+	stale.Add(provider.Message{Role: provider.RoleUser, Content: "second"})
+	stale.Add(provider.Message{Role: provider.RoleUser, Content: "local only"})
+	info, err := stale.SaveRecoveryBranch(RecoveryBranchOptions{OriginalPath: path})
+	if err != nil {
+		t.Fatalf("SaveRecoveryBranch: %v", err)
+	}
+	if _, ok, err := LoadCompactionState(info.Path); err != nil || !ok {
+		t.Fatalf("fork should inherit sidecar: ok=%v err=%v", ok, err)
+	}
+
+	// A new agent bound to the recovery path (commitRecoveredSession path)
+	// must load the inherited sidecar and rebind its lineage key to the fork.
+	forkSession, err := LoadSession(info.Path)
+	if err != nil {
+		t.Fatalf("LoadSession fork: %v", err)
+	}
+	a := New(nil, nil, forkSession, Options{
+		SessionPath: info.Path,
+		WorkspaceID: "ws",
+		ModelRef:    "this-model",
+	}, event.Discard)
+	if len(a.compactionState.Projection.Messages) == 0 {
+		t.Fatal("inherited projection was dropped on recovery-fork load")
+	}
+	wantKey := promptCacheKey("ws", BranchID(info.Path), "this-model")
+	if a.compactionState.PromptCacheKey != wantKey {
+		t.Fatalf("PromptCacheKey = %q, want %q", a.compactionState.PromptCacheKey, wantKey)
+	}
+	if a.checkpointState != "restored" {
+		t.Fatalf("checkpointState = %q, want restored", a.checkpointState)
+	}
+	// Rebinding is persisted on the fork's own sidecar.
+	disk, ok, err := LoadCompactionState(info.Path)
+	if err != nil || !ok {
+		t.Fatalf("fork sidecar should remain on disk: ok=%v err=%v", ok, err)
+	}
+	if disk.PromptCacheKey != wantKey {
+		t.Fatalf("persisted fork PromptCacheKey = %q, want %q", disk.PromptCacheKey, wantKey)
+	}
+	// The parent sidecar keeps its own key.
+	parentDisk, ok, err := LoadCompactionState(path)
+	if err != nil || !ok {
+		t.Fatalf("parent sidecar should remain on disk: ok=%v err=%v", ok, err)
+	}
+	if parentDisk.PromptCacheKey != parentKey {
+		t.Fatalf("parent PromptCacheKey changed to %q, want %q", parentDisk.PromptCacheKey, parentKey)
+	}
+}
